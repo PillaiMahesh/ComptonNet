@@ -1,0 +1,264 @@
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers, optimizers
+from tensorflow.keras.callbacks import LearningRateScheduler
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+from skimage.metrics import structural_similarity as ssim
+from scipy.stats import norm
+
+def custom_loss(y_true, y_pred):
+    mse = tf.keras.losses.MeanSquaredError()(y_true, y_pred)
+    mae = tf.keras.losses.MeanAbsoluteError()(y_true, y_pred)
+    penalty = tf.reduce_mean(tf.abs(y_true - y_pred) * tf.square(y_true))
+    return 0.4 * mse + 0.4 * mae + 0.2 * penalty
+
+def create_advanced_model(input_shape):
+    inputs = layers.Input(shape=input_shape)
+    x = layers.Conv2D(128, kernel_size=3, activation='relu', padding='same')(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D(pool_size=(2, 1))(x)
+    x = layers.Conv2D(256, kernel_size=3, activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D(pool_size=(2, 1))(x)
+    x = layers.Conv2D(512, kernel_size=3, activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Reshape((-1, x.shape[-1]))(x)
+    x = layers.Bidirectional(layers.LSTM(512, return_sequences=True))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Bidirectional(layers.LSTM(256))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(1024, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(2, activation='linear', name='output')(x)
+    model = models.Model(inputs, outputs)
+    return model
+
+def data_augmentation(x, y):
+    noise = tf.random.normal(shape=tf.shape(x), mean=0.0, stddev=0.01, dtype=tf.float32)
+    x = tf.cast(x, tf.float32)
+    x = x + noise
+    return x, y
+
+def process_data(df, output_folder):
+    unique_sources = df[['Source_X', 'Source_Y']].drop_duplicates()
+    all_input_data = []
+    all_ground_truths = []
+    all_sources = []
+
+    scaler_input = MinMaxScaler(feature_range=(-1, 1))
+    scaler_output = MinMaxScaler(feature_range=(-1, 1))
+
+    for _, (source_x, source_y) in unique_sources.iterrows():
+        unique_set = df[(df['Source_X'] == source_x) & (df['Source_Y'] == source_y)]
+        input_data = unique_set[['Scatter_X', 'Scatter_Y', 'Energy', 'Absorb_X', 'Absorb_Y', 'Energy_Abs']].values
+        input_data = np.nan_to_num(input_data)
+        input_data = scaler_input.fit_transform(input_data)
+
+        num_events = 3000
+        if input_data.shape[0] < num_events:
+            pad_size = num_events - input_data.shape[0]
+            input_data = np.pad(input_data, ((0, pad_size), (0, 0)), mode='constant')
+        elif input_data.shape[0] > num_events:
+            input_data = input_data[:num_events]
+
+        input_data = input_data.reshape(1, num_events, 1, 6)
+        all_input_data.append(input_data)
+
+        ground_truth = np.array([source_x, source_y], dtype=np.float32).reshape(-1, 2)
+        all_ground_truths.append(ground_truth)
+        all_sources.append((source_x, source_y))
+
+    all_input_data = np.concatenate(all_input_data, axis=0)
+    all_ground_truths = np.concatenate(all_ground_truths)
+    all_ground_truths_scaled = scaler_output.fit_transform(all_ground_truths)
+
+    train_x, temp_x, train_y_scaled, temp_y_scaled, train_sources, temp_sources = train_test_split(
+        all_input_data, all_ground_truths_scaled, all_sources, test_size=0.3, random_state=42)
+
+    val_x, test_x, val_y_scaled, test_y_scaled, val_sources, test_sources = train_test_split(
+        temp_x, temp_y_scaled, temp_sources, test_size=0.5, random_state=42)
+
+    num_unique_sets = len(unique_sources)
+    split_info = f"Output folder: {output_folder}\n"
+    split_info += f"Total unique sets: {num_unique_sets}\n"
+    split_info += f"Train unique sets: {len(train_sources)} ({len(train_sources) / num_unique_sets * 100:.2f}%)\n"
+    split_info += f"Validation unique sets: {len(val_sources)} ({len(val_sources) / num_unique_sets * 100:.2f}%)\n"
+    split_info += f"Test unique sets: {len(test_sources)} ({len(test_sources) / num_unique_sets * 100:.2f}%)\n"
+
+    print(split_info)
+
+    with open(os.path.join(output_folder, 'dataset_split_info.txt'), 'w') as f:
+        f.write(split_info)
+
+    return (train_x, train_y_scaled, val_x, val_y_scaled, test_x, test_y_scaled,
+            train_sources, val_sources, test_sources, scaler_output)
+
+def visualize_predictions(test_y_scaled, predictions_scaled, sources, output_folder, scaler):
+    predictions = scaler.inverse_transform(predictions_scaled)
+    test_y = scaler.inverse_transform(test_y_scaled)
+
+    ssim_values = []
+    mse_values = []
+    mae_values = []
+    euclidean_distances = []
+    x_differences = []
+    y_differences = []
+
+    for i, (source_x, source_y) in enumerate(sources):
+        pred_x, pred_y = predictions[i]
+        true_x, true_y = test_y[i]
+
+        x_diff = true_x - pred_x
+        y_diff = true_y - pred_y
+        x_differences.append(x_diff)
+        y_differences.append(y_diff)
+
+        euclidean_distance = np.sqrt((pred_x - source_x) ** 2 + (pred_y - source_y) ** 2)
+        euclidean_distances.append(euclidean_distance)
+
+        true_img = np.zeros((256, 256))
+        true_img[int(true_y), int(true_x)] = 1
+        true_img = gaussian_filter(true_img, sigma=2)
+
+        pred_img = np.zeros((256, 256))
+        pred_img[int(pred_y), int(pred_x)] = 1
+        pred_img = gaussian_filter(pred_img, sigma=2)
+
+        data_range = true_img.max() - true_img.min()
+        current_ssim = ssim(true_img, pred_img, data_range=data_range)
+        current_mse = np.mean((true_img - pred_img) ** 2)
+        current_mae = np.mean(np.abs(true_img - pred_img))
+
+        ssim_values.append(current_ssim)
+        mse_values.append(current_mse)
+        mae_values.append(current_mae)
+
+        # Save individual prediction visualizations
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow(true_img, cmap='hot', interpolation='nearest')
+        plt.title(f'Ground Truth - X: {source_x}, Y: {source_y}')
+        plt.subplot(1, 2, 2)
+        plt.imshow(pred_img, cmap='hot', interpolation='nearest')
+        plt.title(f'Predicted - X: {pred_x:.2f}, Y: {pred_y:.2f}')
+        plt.savefig(os.path.join(output_folder, f'prediction_{i}.png'))
+        plt.close()
+
+    x_differences_positive = [diff for diff in x_differences if diff >= 0]
+    y_differences_positive = [diff for diff in y_differences if diff >= 0]
+
+    # Histogram for X differences (positive values only)
+    plt.figure(figsize=(12, 6))
+    n, bins, patches = plt.hist(x_differences_positive, bins=30, edgecolor='black')
+    plt.xlabel('Difference for X')
+    plt.ylabel('Test Sets')
+    plt.title('Histogram of Positive Differences for X Coordinates')
+    plt.xlim(left=0)  # Set the left limit of x-axis to 0
+    plt.gca().yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, 'x_difference_histogram_positive.png'))
+    plt.close()
+
+    # Histogram for Y differences (positive values only)
+    plt.figure(figsize=(12, 6))
+    n, bins, patches = plt.hist(y_differences_positive, bins=30, edgecolor='black')
+    plt.xlabel('Difference for Y')
+    plt.ylabel('Test Sets')
+    plt.title('Histogram of Positive Differences for Y Coordinates')
+    plt.xlim(left=0)  # Set the left limit of x-axis to 0
+    plt.gca().yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, 'y_difference_histogram_positive.png'))
+    plt.close()
+
+    # Histogram of Euclidean distances
+    plt.figure(figsize=(12, 6))
+    n, bins, patches = plt.hist(euclidean_distances, bins=30, edgecolor='black')
+    plt.xlabel('Euclidean Distance')
+    plt.ylabel('Test Sets')
+    plt.title('Histogram of Euclidean Distances (Source vs Predicted)')
+    plt.gca().yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, 'euclidean_distance_histogram.png'))
+    plt.close()
+
+    return ssim_values, mse_values, mae_values, euclidean_distances
+
+
+def train_and_evaluate(input_file: str, output_folder: str):
+    Path(output_folder).mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(input_file)
+    (train_x, train_y_scaled, val_x, val_y_scaled, test_x, test_y_scaled,
+     train_sources, val_sources, test_sources, scaler_output) = process_data(df, output_folder)
+
+    input_shape = train_x.shape[1:]
+    model = create_advanced_model(input_shape)
+    print("\nModel Summary:")
+    model.summary()
+    
+    model.compile(optimizer=optimizers.Adam(learning_rate=0.001), loss=custom_loss, metrics=['mae', 'mse'])
+    history = model.fit(train_x, train_y_scaled,
+                        epochs=400,
+                        batch_size=32,
+                        validation_data=(val_x, val_y_scaled),
+                        callbacks=[LearningRateScheduler(lambda epoch: 0.001 * (0.95 ** epoch))])
+
+    test_loss, test_mae, test_mse = model.evaluate(test_x, test_y_scaled)
+    predictions_scaled = model.predict(test_x)
+
+    ssim_values, mse_values, mae_values, euclidean_distances = visualize_predictions(
+        test_y_scaled=test_y_scaled,
+        predictions_scaled=predictions_scaled,
+        sources=test_sources,
+        output_folder=output_folder,
+        scaler=scaler_output,
+    )
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['mae'], label='Train MAE')
+    plt.plot(history.history['val_mae'], label='Validation MAE')
+    plt.title('Model MAE')
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_folder, 'training_history.png'))
+    plt.close()
+
+    # Save evaluation results to a file
+    with open(os.path.join(output_folder, 'evaluation_results.txt'), 'w') as f:
+        f.write(f"Test Loss: {test_loss:.4f}\n")
+        f.write(f"Test MAE: {test_mae:.4f}\n")
+        f.write(f"Test MSE: {test_mse:.4f}\n")
+        f.write(f"Average SSIM: {np.mean(ssim_values):.4f}\n")
+        f.write(f"Average MSE: {np.mean(mse_values):.4f}\n")
+        f.write(f"Average MAE: {np.mean(mae_values):.4f}\n")
+        f.write(f"Average Euclidean Distance: {np.mean(euclidean_distances):.4f}\n")
+
+        print("\nEvaluation results saved to evaluation_results.txt")
+
+if __name__ == "__main__":
+    input_file = "/home/es/Desktop/g058378_ComptonNet/source_split/sorted data/sorted_file.csv"  # Replace with your input file path
+    output_folder = "/home/es/Desktop/g058378_ComptonNet/source_split/newsource/n1440split"  # Replace with your desired output folder path
+
+    train_and_evaluate(input_file=input_file, output_folder=output_folder)
