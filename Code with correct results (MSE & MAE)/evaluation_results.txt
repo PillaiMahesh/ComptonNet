@@ -1,7 +1,0 @@
-Test Loss: 1.5421
-Test MAE: 0.5966
-Test MSE: 0.5012
-Average SSIM: 0.9935
-Average MSE: 0.0000
-Average MAE: 0.0000
-Average Euclidean Distance: 56.8160
