@@ -1,0 +1,5 @@
+Output folder: /home/es/Desktop/g058378_ComptonNet/source_split/newsource/n1440split
+Total unique sets: 1441
+Train unique sets: 1008 (69.95%)
+Validation unique sets: 216 (14.99%)
+Test unique sets: 217 (15.06%)
