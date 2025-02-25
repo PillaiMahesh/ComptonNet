@@ -1,0 +1,282 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, regularizers
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+from skimage.metrics import structural_similarity as ssim
+import os
+
+# Set the input file path and output folder
+input_file_path = r"/home/es/Desktop/g058378_ComptonNet/source_split/sorted data/sorted_file.csv"
+output_folder = r"/home/es/Desktop/g058378_ComptonNet/source_split/newsource/o1440split"
+
+# Convert to absolute path and create the output folder if it doesn't exist
+output_folder = os.path.abspath(output_folder)
+os.makedirs(output_folder, exist_ok=True)
+print(f"Output folder: {output_folder}")
+
+def custom_loss(y_true, y_pred):
+    mse = tf.keras.losses.MeanSquaredError()(y_true, y_pred)
+    bce = tf.keras.losses.BinaryCrossentropy()(y_true, y_pred)
+    return mse + bce
+
+def create_advanced_model(input_shape):
+    inputs = layers.Input(shape=input_shape)
+
+    # Convolutional layers
+    x = layers.Conv2D(64, kernel_size=3, activation='relu', padding='same')(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D(pool_size=(2, 1))(x)
+
+    x = layers.Conv2D(128, kernel_size=3, activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D(pool_size=(2, 1))(x)
+
+    x = layers.Conv2D(256, kernel_size=3, activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D(pool_size=(2, 1))(x)
+
+    # LSTM layer
+    x = layers.Reshape((-1, x.shape[-1]))(x)
+    x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(x)
+    x = layers.Bidirectional(layers.LSTM(128))(x)
+
+    # Dense layers
+    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+    x = layers.Dropout(0.5)(x)
+
+    # Output layers
+    x_output = layers.Dense(1, activation='sigmoid', name='x_output')(x)
+    y_output = layers.Dense(1, activation='sigmoid', name='y_output')(x)
+    outputs = layers.Concatenate()([x_output, y_output])
+
+    model = models.Model(inputs, outputs)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
+                  loss=custom_loss,
+                  metrics=['accuracy', 'mean_squared_error'])
+    return model
+
+def process_data(df):
+    unique_sources = df[['Source_X', 'Source_Y']].drop_duplicates()
+    all_input_data = []
+    all_ground_truths = []
+    all_sources = []
+
+    scaler = StandardScaler()
+
+    for _, (source_x, source_y) in unique_sources.iterrows():
+        unique_set = df[(df['Source_X'] == source_x) & (df['Source_Y'] == source_y)]
+        input_data = unique_set[['Scatter_X', 'Scatter_Y', 'Energy', 'Absorb_X', 'Absorb_Y', 'Energy_Abs']].values
+        input_data = np.nan_to_num(input_data)
+
+        # Standardize the input data
+        input_data = scaler.fit_transform(input_data)
+
+        num_events = 3000
+        if input_data.shape[0] < num_events:
+            pad_size = num_events - input_data.shape[0]
+            input_data = np.pad(input_data, ((0, pad_size), (0, 0)), mode='constant')
+        elif input_data.shape[0] > num_events:
+            input_data = input_data[:num_events]
+
+        input_data = input_data.reshape(1, num_events, 1, 6)
+        all_input_data.append(input_data)
+
+        # Normalize ground truth
+        ground_truth = np.array([source_x / 255, source_y / 255], dtype=np.float32)
+        all_ground_truths.append(ground_truth)
+        all_sources.append((source_x, source_y))
+
+    all_input_data = np.concatenate(all_input_data, axis=0)
+    all_ground_truths = np.array(all_ground_truths)
+
+    train_x, temp_x, train_y, temp_y, train_sources, temp_sources = train_test_split(
+        all_input_data, all_ground_truths, all_sources, test_size=0.3, random_state=42)
+    val_x, test_x, val_y, test_y, val_sources, test_sources = train_test_split(
+        temp_x, temp_y, temp_sources, test_size=0.5, random_state=42)
+
+    # Print dataset split info
+    num_unique_sets = len(unique_sources)
+    print(f"Total unique sets: {num_unique_sets}")
+    print(f"Train unique sets: {len(train_sources)} ({len(train_sources) / num_unique_sets * 100:.2f}%)")
+    print(f"Validation unique sets: {len(val_sources)} ({len(val_sources) / num_unique_sets * 100:.2f}%)")
+    print(f"Test unique sets: {len(test_sources)} ({len(test_sources) / num_unique_sets * 100:.2f}%)")
+
+    return train_x, train_y, val_x, val_y, test_x, test_y, train_sources, val_sources, test_sources
+
+def plot_training_history(history):
+    epochs = range(1, len(history.history['loss']) + 1)
+
+    plt.figure(figsize=(15, 5))
+
+    plt.subplot(1, 3, 1)
+    plt.plot(epochs, history.history['loss'], label='Training Loss')
+    if 'val_loss' in history.history:
+        plt.plot(epochs, history.history['val_loss'], label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs, history.history['accuracy'], label='Training Accuracy')
+    if 'val_accuracy' in history.history:
+        plt.plot(epochs, history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs, history.history['mean_squared_error'], label='Training MSE')
+    if 'val_mean_squared_error' in history.history:
+        plt.plot(epochs, history.history['val_mean_squared_error'], label='Validation MSE')
+    plt.title('Training and Validation MSE')
+    plt.xlabel('Epochs')
+    plt.ylabel('MSE')
+    plt.legend()
+
+    plt.tight_layout()
+    return plt.gcf()
+
+def visualize_predictions(test_y, predictions, sources):
+    ssim_values = []
+    mse_values = []
+    euclidean_distances = []
+
+    for i, (source_x, source_y) in enumerate(sources):
+        pred_x, pred_y = predictions[i] * 255  # Scale back to 0-255 range
+
+        # Create heatmap-like images for visualization
+        true_img = np.zeros((256, 256))
+        true_img[int(source_y), int(source_x)] = 1
+        true_img = gaussian_filter(true_img, sigma=2)
+
+        pred_img = np.zeros((256, 256))
+        pred_img[int(pred_y), int(pred_x)] = 1
+        pred_img = gaussian_filter(pred_img, sigma=2)
+
+        # Specify data_range for ssim calculation
+        data_range = true_img.max() - true_img.min()  # Dynamic range of the images
+        current_ssim = ssim(true_img, pred_img, data_range=data_range)  # Pass data_range to ssim
+
+        current_mse = np.mean((true_img - pred_img) ** 2)
+        ssim_values.append(current_ssim)
+        mse_values.append(current_mse)
+
+        euclidean_distance = np.sqrt((pred_x - source_x) ** 2 + (pred_y - source_y) ** 2)
+        euclidean_distances.append(euclidean_distance)
+
+        plt.figure(figsize=(10, 5))
+
+        plt.subplot(1, 2, 1)
+        plt.imshow(true_img, cmap='hot', interpolation='nearest')
+        plt.title(f'Ground Truth - X: {source_x}, Y: {source_y}')
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(pred_img, cmap='hot', interpolation='nearest')
+        plt.title(f'Predicted - X: {pred_x:.2f}, Y: {pred_y:.2f}')
+
+        prediction_path = os.path.join(output_folder, f'prediction_{i}.png')
+        plt.savefig(prediction_path)
+        plt.close()
+        print(f"Prediction plot {i} saved to: {prediction_path}")
+
+    return ssim_values, mse_values, euclidean_distances
+
+def train_and_evaluate(df):
+    train_x, train_y, val_x, val_y, test_x, test_y, train_sources, val_sources, test_sources = process_data(df)
+
+    model = create_advanced_model(train_x.shape[1:])
+    model.summary()
+
+    early_stopping = callbacks.EarlyStopping(monitor='val_loss', patience=600, restore_best_weights=True)
+    reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=15, min_lr=1e-6)
+
+    history = model.fit(
+        train_x, train_y,
+        epochs=350,
+        batch_size=32,
+        validation_data=(val_x, val_y),
+        callbacks=[early_stopping, reduce_lr]
+    )
+
+    # Save training history plot
+    try:
+        history_plot = plot_training_history(history)
+        history_plot_path = os.path.join(output_folder, 'training_history.png')
+        history_plot.savefig(history_plot_path)
+        plt.close(history_plot)
+        print(f"Training history plot saved to: {history_plot_path}")
+    except Exception as e:
+        print(f"Error saving training history plot: {e}")
+
+    predictions = model.predict(test_x)
+    ssim_values, mse_values, euclidean_distances = visualize_predictions(test_y, predictions, test_sources)
+
+    # Save SSIM and MSE plot
+    try:
+        ssim_mse_plot_path = os.path.join(output_folder, 'ssim_mse_plot.png')
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        plt.plot(ssim_values, label='SSIM')
+        plt.xlabel('Test Sample')
+        plt.ylabel('SSIM')
+        plt.title('SSIM for Test Samples')
+        plt.legend()
+
+        plt.subplot(1, 2, 2)
+        plt.plot(mse_values, label='MSE', color='orange')
+        plt.xlabel('Test Sample')
+        plt.ylabel('MSE')
+        plt.title('MSE for Test Samples')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(ssim_mse_plot_path)
+        plt.close()
+        print(f"SSIM and MSE plot saved to: {ssim_mse_plot_path}")
+    except Exception as e:
+        print(f"Error saving SSIM and MSE plot: {e}")
+
+    # Save Euclidean distances histogram
+    try:
+        hist_plot_path = os.path.join(output_folder, 'euclidean_distances_histogram.png')
+        plt.figure(figsize=(8, 6))
+        plt.hist(euclidean_distances, bins=50, color='skyblue', edgecolor='black')
+        plt.title('Histogram of Euclidean Distances (Predicted vs Ground Truth)')
+        plt.xlabel('Euclidean Distance')
+        plt.ylabel('Frequency')
+        plt.savefig(hist_plot_path)
+        plt.close()
+        print(f"Euclidean distances histogram saved to: {hist_plot_path}")
+    except Exception as e:
+        print(f"Error saving Euclidean distances histogram: {e}")
+
+    test_loss, test_accuracy, test_mse = model.evaluate(test_x, test_y)
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {test_accuracy:.4f}")
+    print(f"Test MSE: {test_mse:.4f}")
+
+    # Save test results to a text file
+    try:
+        results_file_path = os.path.join(output_folder, 'test_results.txt')
+        with open(results_file_path, 'w') as f:
+            f.write(f"Test Loss: {test_loss:.4f}\n")
+            f.write(f"Test Accuracy: {test_accuracy:.4f}\n")
+            f.write(f"Test MSE: {test_mse:.4f}\n")
+        print(f"Test results saved to: {results_file_path}")
+    except Exception as e:
+        print(f"Error saving test results: {e}")
+
+if __name__ == "__main__":
+    try:
+        df = pd.read_csv(input_file_path)
+        train_and_evaluate(df)
+    except Exception as e:
+        print(f"An error occurred: {e}")
